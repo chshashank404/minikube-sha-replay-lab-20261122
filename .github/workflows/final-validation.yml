@@ -1,0 +1,282 @@
+name: Final minikube external-fork validation
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+env:
+  STATUS_CONTEXT: Final validation / source-faithful check
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+jobs:
+  observer:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Record pull request event
+        env:
+          EVENT_ACTION: ${{ github.event.action }}
+          EVENT_ACTOR: ${{ github.actor }}
+          EVENT_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          EVENT_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          printf 'observed_at=%s\naction=%s\nactor=%s\nhead_repo=%s\nhead_ref=%s\nhead_sha=%s\n' \
+            "$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')" "$EVENT_ACTION" "$EVENT_ACTOR" \
+            "$EVENT_HEAD_REPO" "$EVENT_HEAD_REF" "$EVENT_HEAD_SHA"
+
+  source-faithful-check:
+    if: |
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request != null &&
+      contains(github.event.comment.body, 'ok-to-build-image') &&
+      (
+        github.event.comment.user.login == 'minikube-bot' ||
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+      )
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-pr-${{ github.event.issue.number }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      statuses: write
+      pull-requests: write
+    steps:
+      - name: Verify comment author is in OWNERS
+        if: github.event_name == 'issue_comment' && github.event.comment.user.login != 'minikube-bot' && github.event.comment.author_association != 'OWNER'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMENT_USER: ${{ github.event.comment.user.login }}
+        run: |
+          if ! gh api "repos/${GITHUB_REPOSITORY}/contents/OWNERS" -H "Accept: application/vnd.github.raw" | yq '.reviewers[], .approvers[]' | grep -qix "${COMMENT_USER}"; then
+            echo "User ${COMMENT_USER} is not in OWNERS reviewers or approvers" && exit 1
+          fi
+
+      - name: Validate input
+        id: input
+        env:
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          case "${PR_NUMBER}" in
+            '' | *[!0-9]*)
+              echo "::error::Invalid PR number '${PR_NUMBER}': expected a number" && exit 1
+              ;;
+          esac
+          echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Record issue comment and authorization
+        env:
+          COMMENT_ASSOCIATION: ${{ github.event.comment.author_association }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_CREATED_AT: ${{ github.event.comment.created_at }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          COMMENT_LOGIN: ${{ github.event.comment.user.login }}
+          EVENT_ACTION: ${{ github.event.action }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cp "$GITHUB_EVENT_PATH" evidence/issue-comment-event.json
+          gh api "repos/${GITHUB_REPOSITORY}/issues/comments/${COMMENT_ID}" > evidence/comment-api.json
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${{ steps.input.outputs.pr_number }}" > evidence/pr-before-resolution.json
+          jq -n \
+            --arg observed_at "$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')" \
+            --arg event_name "$GITHUB_EVENT_NAME" --arg action "$EVENT_ACTION" \
+            --arg login "$COMMENT_LOGIN" --arg association "$COMMENT_ASSOCIATION" \
+            --arg body "$COMMENT_BODY" --arg created_at "$COMMENT_CREATED_AT" \
+            --argjson is_pr '${{ github.event.issue.pull_request != null }}' \
+            --argjson job_gate_authorized '${{ github.event.comment.user.login == 'minikube-bot' || contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association) }}' \
+            '{observed_at:$observed_at,event_name:$event_name,action:$action,is_pull_request:$is_pr,
+              comment:{login:$login,author_association:$association,body:$body,created_at:$created_at},
+              job_gate_authorized:$job_gate_authorized,
+              owners_step_required:($login != "minikube-bot" and $association != "OWNER")}' \
+            > evidence/authorization.json
+
+      - name: Resolve and verify PR head
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.input.outputs.pr_number }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_AT: ${{ github.event.comment.created_at }}
+        run: |
+          set -euo pipefail
+          now() { date -u +'%Y-%m-%dT%H:%M:%S.%NZ'; }
+          fail() {
+            local short="$1" detail="${2:-}"
+            jq -n --arg decision REJECT --arg reason "$short" --arg detail "$detail" \
+              --arg observed_at "$(now)" \
+              '{decision:$decision,reason:$reason,detail:$detail,observed_at:$observed_at}' \
+              > evidence/decision.json
+            echo "failure_reason=$short" >> "$GITHUB_OUTPUT"
+            echo "::error::$short $detail"
+            exit 1
+          }
+
+          PR_VIEW_STARTED_AT="$(now)"
+          HEAD_VIEW_JSON="$(gh pr view "${PR_NUMBER}" --json headRefOid)"
+          printf '%s\n' "$HEAD_VIEW_JSON" > evidence/gh-pr-view-head-resolution.json
+          HEAD_SHA="$(jq -r .headRefOid <<<"$HEAD_VIEW_JSON")"
+          REPO_VIEW_JSON="$(gh pr view "${PR_NUMBER}" --json headRepositoryOwner,headRepository,headRefName,author)"
+          printf '%s\n' "$REPO_VIEW_JSON" > evidence/gh-pr-view-repository-resolution.json
+          PR_REPO="$(jq -r '.headRepositoryOwner.login + "/" + .headRepository.name' <<<"$REPO_VIEW_JSON")"
+          HEAD_REF="$(jq -r .headRefName <<<"$REPO_VIEW_JSON")"
+          PR_VIEW_RECEIVED_AT="$(now)"
+          echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+
+          gh api --silent -X POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=pending -f context="${STATUS_CONTEXT}" -f target_url="${RUN_URL}" \
+            -f description="Final validation in progress"
+
+          APPROVED_SHA=$(echo "${COMMENT_BODY}" | tr -d '\r' | awk '/ok-to-build-image/ {print $2; exit}')
+          jq -n --arg comment_body "$COMMENT_BODY" --arg approved_sha "$APPROVED_SHA" \
+            --arg head_sha "$HEAD_SHA" \
+            '{comment_body:$comment_body,approved_sha:$approved_sha,head_sha:$head_sha,
+              selected_path:(if $approved_sha == "" then "unpinned-timestamp" else "explicit-sha" end)}' \
+            > evidence/comment-parsing.json
+
+          LATE_FORCE_PUSH='not-queried-explicit-path'
+          LAST_PUSHED_AT='not-queried-explicit-path'
+          if [ -n "${COMMENT_BODY}" ] && [ "${PR_REPO}" != "minikube-bot/minikube" ]; then
+            if [ -n "${APPROVED_SHA}" ]; then
+              if [ "${HEAD_SHA}" != "${APPROVED_SHA}" ]; then
+                fail "PR head does not match the approved SHA; comment ok-to-build-image again" "head=${HEAD_SHA} approved=${APPROVED_SHA}"
+              fi
+            else
+              gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/events?per_page=100" > evidence/pr-events.json
+              LATE_FORCE_PUSH=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/events?per_page=100" \
+                --jq ".[] | select(.event == \"head_ref_force_pushed\" and .created_at > \"${COMMENT_AT}\") | .created_at" | head -n1)
+              if [ -n "${LATE_FORCE_PUSH}" ]; then
+                fail "PR was force pushed after the approval comment; comment ok-to-build-image again" "force_pushed=${LATE_FORCE_PUSH} comment=${COMMENT_AT}"
+              fi
+              RUNS_REQUEST_STARTED_AT="$(now)"
+              gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${HEAD_SHA}&event=pull_request&per_page=100" \
+                > evidence/runs-api.json
+              RUNS_RESPONSE_RECEIVED_AT="$(now)"
+              LAST_PUSHED_AT=$(jq -r '[.workflow_runs[].created_at] | max // empty' evidence/runs-api.json)
+              if [ -z "${LAST_PUSHED_AT}" ]; then
+                fail "Could not determine when the PR head was pushed; comment ok-to-build-image ${HEAD_SHA:0:12}" "head=${HEAD_SHA} (no pull_request workflow runs found)"
+              fi
+              if [ "${LAST_PUSHED_AT}" \> "${COMMENT_AT}" ]; then
+                fail "PR head was pushed after the approval comment; comment ok-to-build-image again" "head=${HEAD_SHA} pushed=${LAST_PUSHED_AT} comment=${COMMENT_AT}"
+              fi
+            fi
+          fi
+
+          BRANCH_REQUEST_STARTED_AT="$(now)"
+          gh api "repos/${PR_REPO}/git/ref/heads/${HEAD_REF}" > evidence/fork-branch-ref.json
+          BRANCH_RESPONSE_RECEIVED_AT="$(now)"
+          git ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" "refs/pull/${PR_NUMBER}/head" \
+            > evidence/pull-ref-ls-remote.txt
+          FETCH_STARTED_AT="$(now)"
+          git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head"
+          git checkout --detach "${HEAD_SHA}"
+          CHECKOUT_COMPLETED_AT="$(now)"
+          CHECKED_OUT_SHA="$(git rev-parse HEAD)"
+
+          jq -n \
+            --arg decision ACCEPT --arg reason source-faithful-check-passed \
+            --arg comment_at "$COMMENT_AT" --arg comment_body "$COMMENT_BODY" \
+            --arg approved_sha "$APPROVED_SHA" --arg head_sha "$HEAD_SHA" \
+            --arg pr_repo "$PR_REPO" --arg head_ref "$HEAD_REF" \
+            --arg late_force_push "$LATE_FORCE_PUSH" --arg last_pushed_at "$LAST_PUSHED_AT" \
+            --arg pr_view_started_at "$PR_VIEW_STARTED_AT" --arg pr_view_received_at "$PR_VIEW_RECEIVED_AT" \
+            --arg runs_request_started_at "${RUNS_REQUEST_STARTED_AT:-not-run}" \
+            --arg runs_response_received_at "${RUNS_RESPONSE_RECEIVED_AT:-not-run}" \
+            --arg branch_request_started_at "$BRANCH_REQUEST_STARTED_AT" \
+            --arg branch_response_received_at "$BRANCH_RESPONSE_RECEIVED_AT" \
+            --arg fetch_started_at "$FETCH_STARTED_AT" --arg checkout_completed_at "$CHECKOUT_COMPLETED_AT" \
+            --arg checked_out_sha "$CHECKED_OUT_SHA" \
+            '{decision:$decision,reason:$reason,comment_at:$comment_at,comment_body:$comment_body,
+              approved_sha:$approved_sha,head_sha:$head_sha,pr_repo:$pr_repo,head_ref:$head_ref,
+              late_force_push:$late_force_push,last_pushed_at:$last_pushed_at,
+              pr_view_started_at:$pr_view_started_at,pr_view_received_at:$pr_view_received_at,
+              runs_request_started_at:$runs_request_started_at,
+              runs_response_received_at:$runs_response_received_at,
+              branch_request_started_at:$branch_request_started_at,
+              branch_response_received_at:$branch_response_received_at,
+              fetch_started_at:$fetch_started_at,checkout_completed_at:$checkout_completed_at,
+              checked_out_sha:$checked_out_sha}' > evidence/decision.json
+          cat evidence/decision.json
+
+      - name: Execute checked-out PR script
+        if: steps.pr.outcome == 'success'
+        run: |
+          set -euo pipefail
+          test -x ./hack/final-validation.sh
+          ./hack/final-validation.sh | tee evidence/execution.log
+          if grep -Fx 'MINIKUBE_APPROVAL_BYPASS_EXECUTION_CONFIRMED' evidence/execution.log; then
+            echo 'execution_class=restored-M' > evidence/execution-class.txt
+          elif grep -Fx 'BENIGN_APPROVED_REVISION' evidence/execution.log; then
+            echo 'execution_class=benign-B' > evidence/execution-class.txt
+          else
+            echo 'unexpected script output' >&2
+            exit 1
+          fi
+
+      - name: Simulate credential setup with a dummy value
+        if: steps.pr.outcome == 'success'
+        env:
+          DUMMY_REGISTRY_PASSWORD: not-a-secret-final-validation-only
+        run: |
+          set -euo pipefail
+          test "$DUMMY_REGISTRY_PASSWORD" = 'not-a-secret-final-validation-only'
+          printf 'dummy_login_completed_at=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')" \
+            > "$RUNNER_TEMP/dummy-login-complete"
+          echo 'Dummy credential was scoped only to this trusted simulation step.'
+
+      - name: Simulate later artifact use locally
+        if: steps.pr.outcome == 'success'
+        run: |
+          set -euo pipefail
+          test -f "$RUNNER_TEMP/dummy-login-complete"
+          test -f lab-context/payload.txt
+          cp lab-context/payload.txt evidence/simulated-published-payload.txt
+          sha256sum lab-context/payload.txt > evidence/simulated-published-payload.sha256
+          if grep -Fx 'UNAPPROVED_WORKSPACE_INFLUENCE' evidence/simulated-published-payload.txt; then
+            echo 'artifact_class=restored-M' > evidence/artifact-class.txt
+          elif grep -Fx 'BENIGN_WORKSPACE_CONTENT' evidence/simulated-published-payload.txt; then
+            echo 'artifact_class=benign-B' > evidence/artifact-class.txt
+          else
+            echo 'unexpected simulated artifact content' >&2
+            exit 1
+          fi
+          echo 'No network, registry, package, release, or external publication occurred.' \
+            > evidence/publication-boundary.txt
+
+      - name: Record post-check PR and run observations
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          date -u +'%Y-%m-%dT%H:%M:%S.%NZ' > evidence/post-check-observed-at.txt
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${{ steps.input.outputs.pr_number }}" \
+            > evidence/pr-after-check.json
+          if [ -n "${{ steps.pr.outputs.head_sha }}" ]; then
+            gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${{ steps.pr.outputs.head_sha }}&event=pull_request&per_page=100" \
+              > evidence/runs-api-after-check.json
+          fi
+
+      - name: Upload final-validation evidence
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
+        with:
+          name: final-validation-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 7
+
